@@ -246,9 +246,6 @@ def _download_version(version):
 
 def _known_ids(con):
     '''Get an iterator over all version IDs currently in the db.'''
-    # This is silly but effective as long as the number of ids is small and
-    # allocation behaviour by streaming everything unknown.
-    # Ok, this is really just silly.
     sql = '''SELECT id
              FROM crates
              ORDER BY crate, num
@@ -307,15 +304,26 @@ def dump_crate_to_file(id_or_name, num=None):
         f.write(buf)
 
 
-def _iter_crates_from_db():
+def _fetch_many(cursor, arraysize=None):
+    if arraysize is None:
+        arraysize = cursor.arraysize
+    while True:
+        results = cursor.fetchmany(arraysize)
+        if not results:
+            break
+        for result in results:
+            yield result
+
+
+def _iter_crates_from_db(buffersize=10):
     '''Iterate over all crates currently in the db.'''
-    con = _get_db_connection()
+    cursor = _get_db_connection().cursor()
     sql = '''SELECT id, crate, num, body
              FROM crates
-             WHERE id = ?
           '''
-    for id in _known_ids(con):
-        yield Crate(*con.execute(sql, (id, )).fetchone())
+    cursor.execute(sql)
+    for row in _fetch_many(cursor, buffersize):
+        yield Crate(*row)
 
 
 def _unpacked_size():
@@ -465,12 +473,12 @@ def report_counts():
             return ''
         return _escape_pattern.sub('\\\\\\1', particle)
 
-    print("Reason | Info | Count \n --- | --- | ---")
+    print("Reason|Info|Count \n ---|---|---")
 
     for reason, count, info in sorted(((r, c, i) for (r, i), c in
                                        _count_warnings().items()),
                                       reverse=True):
-        print(' | '.join(map(_markdown_escape, (reason, info, str(count)))))
+        print('|'.join(map(_markdown_escape, (reason, info, str(count)))))
 
 
 class TestFileDetection(unittest.TestCase):
