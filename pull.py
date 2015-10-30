@@ -137,7 +137,8 @@ LOCAL_BUILD_FILENAMES = frozenset(
      '.travis-update-gh-pages.sh', '.gdb_history', '.sigar_shellrc',
      '.valgrind.supp', '.dockerignore', '.emacs.bmk', '.hgignore',
      '.travis-bench', '.zuul.yml', '.npmrc', '.eslintignore', '.dntrc',
-     '.jsbeautifyrc', '.sconsign.dblite', '.jscs.json'))
+     '.jsbeautifyrc', '.sconsign.dblite', '.jscs.json', '.astylerc',
+     '.build.sh', '.buildpack'))
 LOCAL_BUILD_DIRS = frozenset(
     ('.git', '.gitreview', '.hg', '.snakemake', '.gitted', '.travis', '.deps',
      '.libs', '.cargo' '.sconf_temp', '.ci', '.fingerprint', '.idea',
