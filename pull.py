@@ -268,6 +268,7 @@ github to get a dump (~2.6gb) torrented.'''
     sql = '''CREATE TABLE IF NOT EXISTS crates
                 (id INT PRIMARY KEY, crate TEXT, num TEXT, body BLOB)
           '''
+    con.execute(sql)
     known_ids = frozenset(_known_ids(con))
     for crate in _iter_crates():
         for version in _iter_versions(crate):
