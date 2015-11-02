@@ -41,6 +41,7 @@ class Crate(object):
 
 
 class Warning(object):
+    __slots__ = ('crate_name', 'num', 'info', 'member_name')
 
     def __init__(self, crate_name, num, info=None, member_name=None):
         self.crate_name = crate_name
@@ -417,13 +418,17 @@ def _check_worker(crate):
 
 def _iter_warnings_async():
     '''Iterate over all warnings for all crates in the db.'''
-    warnings = []
     with multiprocessing.pool.Pool() as pool:
+        results = []
+        idx = 0
         for crate in _iter_crates_from_db():
-            warnings.append(pool.apply_async(_check_worker, args=(crate, )))
+            results.append(pool.apply_async(_check_worker, args=(crate, )))
+            if len(results) - idx > pool._processes:
+                results[idx].wait()
+                idx = len(results)
         pool.close()
         pool.join()
-    for res in warnings:
+    for res in results:
         for r in res.get():
             yield r
 
