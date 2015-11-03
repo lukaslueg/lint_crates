@@ -1,6 +1,7 @@
 ''' A linter for packages on crates.io
 
-python3 -c "import pull; pull.pull_everything()"
+git checkout https://github.com/rust-lang/crates.io-index
+python3 -c "import pull; pull.sync_db_to_index_dir()"
 python3 -c "import pull; pull.report_warnings()" >! report.txt
 python3 -c "import pull; pull.report_counts()" < report.txt | discount-makepage >! report.html
 
@@ -61,9 +62,9 @@ class Warning(object):
     def __str__(self):
         s = self.reason
         if self.member_name is not None:
-            s += " [%s]" % (self.member_name, )
+            s += ' [%s]' % (self.member_name, )
         if self.info is not None:
-            s += " [%s]" % (self.info, )
+            s += ' [%s]' % (self.info, )
         return s
 
 
@@ -204,7 +205,17 @@ DENY_PATTERNS = _load_patterns()
 
 
 def _get_db_connection():
-    return sqlite3.connect('crates.dump', isolation_level=None)
+    con = sqlite3.connect('crates.dump', isolation_level=None)
+    # I don't care about normalization, muaahahahaha
+    sql = '''CREATE TABLE IF NOT EXISTS crates
+                (id INT PRIMARY KEY, crate TEXT, num TEXT, body BLOB)
+          '''
+    con.execute(sql)
+    sql = '''CREATE INDEX IF NOT EXISTS crates_idx
+                ON crates (crate, num)
+          '''
+    con.execute(sql)
+    return con
 
 
 def _fetch_json(url):
@@ -255,36 +266,35 @@ def _known_ids(con):
     return (r[0] for r in con.execute(sql).fetchall())
 
 
+def _fetch_and_insert_crate(cursor, version):
+    sql = '''INSERT INTO crates (id, crate, num, body)
+                VALUES (?, ?, ?, ?)
+            '''
+    cursor.execute(sql, (version['id'], version['crate'], version['num'],
+                         _download_version(version)))
+
+
 def pull_everything():
     '''Fetch all the things from crates.io'''
 
     assert False, '''Please don't do this. Pulling everything this way from
 crates.io places quite an unusual burden on it's S3-account. Contact me on
-github to get a dump (~2.6gb) torrented.'''
+github to get a dump (~2.6gb) torrented'''
 
     con = _get_db_connection()
-    # I don't care about normalization, muaahahahaha
-    sql = '''CREATE TABLE IF NOT EXISTS crates
-                (id INT PRIMARY KEY, crate TEXT, num TEXT, body BLOB)
-          '''
-    con.execute(sql)
     known_ids = frozenset(_known_ids(con))
     for crate in _iter_crates():
         for version in _iter_versions(crate):
-            print("%s (%s)" % (version['crate'], version['num']))
+            print('%s (%s)' % (version['crate'], version['num']))
             if int(version['id']) in known_ids:
-                print("Skipped download")
+                print('Skipped download')
                 continue
-            sql = '''INSERT INTO crates (id, crate, num, body)
-                        VALUES (?, ?, ?, ?)
-                  '''
-            con.execute(sql, (version['id'], version['crate'], version['num'],
-                              _download_version(version)))
+            _fetch_and_insert_crate(con, version)
 
 
 def dump_crate_to_file(id_or_name, num=None):
     '''Get the given crate from the db and write it to disk for further
-    inspection.'''
+    inspection'''
     con = _get_db_connection()
     try:
         id = int(id_or_name)
@@ -302,11 +312,12 @@ def dump_crate_to_file(id_or_name, num=None):
                  WHERE id = ?
               '''
         buf, num, body = con.execute(sql, (id, )).fetchone()
-    with open("%s-%s.tar.gz" % (crate, num), "wb") as f:
+    with open('%s-%s.tar.gz' % (crate, num), 'wb') as f:
         f.write(buf)
 
 
 def _fetch_many(cursor, arraysize=None):
+    '''Scroll through a cursor's results'''
     if arraysize is None:
         arraysize = cursor.arraysize
     while True:
@@ -315,6 +326,61 @@ def _fetch_many(cursor, arraysize=None):
             break
         for result in results:
             yield result
+
+
+def _iter_index_dir(index):
+    '''Iterate over all files describing crates in the index'''
+    for filename in (index / '1').iterdir():
+        yield filename
+    for filename in (index / '2').iterdir():
+        yield filename
+    for filename in (index / '3').glob('?/*'):
+        yield filename
+    for filename in index.glob('??/??/*'):
+        yield filename
+
+
+def _iter_index_dir_crates(index):
+    '''Iterate over all crate-names and -versions in the index'''
+    for filename in _iter_index_dir(index):
+        with filename.open() as f:
+            for line in f:
+                prop = json.loads(line)
+                # TODO checksums anyone?
+                yield prop['name'], prop['vers']
+
+
+def sync_db_to_index_dir(index=pathlib.Path('./crates.io-index')):
+    '''Fetch and put crates into the db that the index knows about'''
+
+    assert False, '''Please don't do this. Pulling everything this way from
+crates.io places quite an unusual burden on it's S3-account. Contact me on
+github to get a dump (~2.6gb) torrented.'''
+
+    con = _get_db_connection()
+    cursor = con.cursor()
+    sql = '''CREATE TEMP TABLE _known_crates
+                (crate TEXT, num TEXT)
+            '''
+    cursor.execute(sql)
+    sql = '''INSERT INTO _known_crates VALUES (?, ?)'''
+    cursor.executemany(sql, _iter_index_dir_crates(index))
+    sql = '''SELECT crate, num
+             FROM _known_crates
+             WHERE NOT EXISTS (SELECT 1
+                               FROM crates
+                               WHERE crates.crate = _known_crates.crate
+                               AND crates.num = _known_crates.num)
+            '''
+    cursor.execute(sql)
+    insert_cursor = con.cursor()
+    for crate, num in _fetch_many(cursor):
+        print((crate, num))
+        version = _fetch_json('/api/v1/crates/%s/%s' % (crate, num))['version']
+        try:
+            _fetch_and_insert_crate(insert_cursor, version)
+        except urllib.error.HTTPError as e:
+            print(e)
 
 
 def _iter_crates_from_db(buffersize=10):
@@ -341,7 +407,7 @@ def _unpacked_size():
 
 
 def _check_crate(crate):
-    '''Check a given crate and iterate over all warnings related to it.'''
+    '''Check a given crate and iterate over all warnings related to it'''
     tar = crate.body
     while True:
         try:
@@ -379,7 +445,7 @@ def _check_crate(crate):
             yield warn(LocalBuildFiles, filename)
         elif filename in TRASH_FILENAMES:
             yield warn(Trash, filename)
-        elif filename[0] == '.':
+        elif filename.startswith('.'):
             yield warn(HiddenFile, filename)
 
         parts = path.parts
@@ -401,9 +467,10 @@ def _check_crate(crate):
             if pattern.part == 'filename':
                 part = filename
             elif pattern.part == 'extension':
-                part = suffix
-                if suffix and suffix[0] == '.':
+                if suffix and suffix.startswith('.'):
                     part = suffix[1:]
+                else:
+                    part = suffix
             elif pattern.part == 'path':
                 part = member.name
             else:
@@ -417,7 +484,7 @@ def _check_worker(crate):
 
 
 def _iter_warnings_async():
-    '''Iterate over all warnings for all crates in the db.'''
+    '''Iterate over all warnings for all crates in the db'''
     with multiprocessing.pool.Pool() as pool:
         results = []
         idx = 0
@@ -435,7 +502,7 @@ def _iter_warnings_async():
 
 def _unique_warnings():
     '''Create a dictionary of (reason, crate, info)s, pointing to dicionaries
-    of affected files, pointing to affected versions.'''
+    of affected files, pointing to affected versions'''
     d = {}
     for warning in _iter_warnings_async():
         if isinstance(warning, (OwnerSet, Executable)):
@@ -448,11 +515,11 @@ def _unique_warnings():
 
 
 def report_warnings():
-    '''Print a possibly human readable report of all warnings for all crate'''
+    '''Print a possibly human readable report of all warnings for all crates'''
     for (reason, crate_name, info), nums_members in _unique_warnings().items():
         for member, nums in nums_members.items():
-            print("\t".join(map(str, (reason, crate_name,
-                                      ";".join(sorted(nums)), info, member))))
+            print('\t'.join(map(str, (reason, crate_name,
+                                      ';'.join(sorted(nums)), info, member))))
 
 
 def _count_warnings():
@@ -469,7 +536,7 @@ def _count_warnings():
 
 def report_counts():
     '''Print a possibly human-readable report of statistics about warnings for
-    all crates in the db. Should get piped to a markdown processor.'''
+    all crates in the db. Should get piped to a markdown processor'''
 
     # TODO does it even work? who knows?
     _escape_pattern = re.compile('([\\`\*_\{\}\[\]\(\)#\+-\.\!])')
@@ -479,7 +546,7 @@ def report_counts():
             return ''
         return _escape_pattern.sub('\\\\\\1', particle)
 
-    print("Reason|Info|Count \n ---|---|---")
+    print('Reason|Info|Count\n---|---|---')
 
     for reason, count, info in sorted(((r, c, i) for (r, i), c in
                                        _count_warnings().items()),
@@ -492,7 +559,7 @@ class TestFileDetection(unittest.TestCase):
     @staticmethod
     def _create_tarfile(member=None):
         buf = io.BytesIO()
-        tar = tarfile.open(fileobj=buf, mode="w:gz")
+        tar = tarfile.open(fileobj=buf, mode='w:gz')
         if member is not None:
             info = tarfile.TarInfo(member)
             info.size = 0
@@ -509,7 +576,7 @@ class TestFileDetection(unittest.TestCase):
     def test_cargo_api_key(self):
         buf, tar = self._create_tarfile()
         info = tarfile.TarInfo('.cargo/config')
-        content = "token = foobar".encode()
+        content = 'token = foobar'.encode()
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
         tar.close()
