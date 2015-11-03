@@ -1,6 +1,6 @@
 ''' A linter for packages on crates.io
 
-git checkout https://github.com/rust-lang/crates.io-index
+git clone https://github.com/rust-lang/crates.io-index
 python3 -c "import pull; pull.sync_db_to_index_dir()"
 python3 -c "import pull; pull.report_warnings()" >! report.txt
 python3 -c "import pull; pull.report_counts()" < report.txt | discount-makepage >! report.html
