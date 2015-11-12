@@ -11,6 +11,7 @@ import collections
 import functools
 import gzip
 import io
+import itertools
 import json
 import multiprocessing.pool
 import os
@@ -161,13 +162,11 @@ def _make_matcher(pattern):
     '''Creates a callable based on a json-derived pattern object that matches a
     string given as the only argument.'''
     if pattern['type'] == 'match':
-        matches = functools.partial(_check_pattern, pattern['pattern'])
+        return functools.partial(_check_pattern, pattern['pattern'])
     elif pattern['type'] == 'regex':
-        matches = functools.partial(_check_re,
-                                    re.compile(pattern['pattern']))
+        return functools.partial(_check_re, re.compile(pattern['pattern']))
     else:
         raise ValueError
-    return matches
 
 
 def _make_sentinel(matches, sentinels):
@@ -184,7 +183,6 @@ def _make_sentinel(matches, sentinels):
 def _load_patterns():
     '''Load the patterns from `git-deny-patterns.json` and build a list of
     useable objects'''
-    patterns = []
     with open('git-deny-patterns.json') as f:
         deny_pattern_json = f.read()
     for pattern in json.loads(deny_pattern_json):
@@ -195,13 +193,11 @@ def _load_patterns():
             pass
         else:
             matches = _make_sentinel(matches, sentinels)
-        p = Pattern(pattern['part'], matches, pattern['caption'],
-                    pattern['description'])
-        patterns.append(p)
-    return patterns
+        yield Pattern(pattern['part'], matches, pattern['caption'],
+                      pattern['description'])
 
 
-DENY_PATTERNS = _load_patterns()
+DENY_PATTERNS = tuple(_load_patterns())
 
 
 def _get_db_connection():
@@ -239,8 +235,7 @@ def _iter_crates():
         crates = _fetch_json(url)['crates']
         if len(crates) == 0:
             break
-        for crate in crates:
-            yield crate
+        yield from crates
         page += 1
 
 
@@ -324,20 +319,13 @@ def _fetch_many(cursor, arraysize=None):
         results = cursor.fetchmany(arraysize)
         if not results:
             break
-        for result in results:
-            yield result
+        yield from results
 
 
 def _iter_index_dir(index):
     '''Iterate over all files describing crates in the index'''
-    for filename in (index / '1').iterdir():
-        yield filename
-    for filename in (index / '2').iterdir():
-        yield filename
-    for filename in (index / '3').glob('?/*'):
-        yield filename
-    for filename in index.glob('??/??/*'):
-        yield filename
+    return itertools.chain((index / '1').iterdir(), (index / '2').iterdir(),
+                           (index / '3').glob('?/*'), index.glob('??/??/*'))
 
 
 def _iter_index_dir_crates(index):
@@ -390,8 +378,7 @@ def _iter_crates_from_db(buffersize=10):
              FROM crates
           '''
     cursor.execute(sql)
-    for row in _fetch_many(cursor, buffersize):
-        yield Crate(*row)
+    return (Crate(*row) for row in _fetch_many(cursor, buffersize))
 
 
 def _unpacked_size():
@@ -448,10 +435,20 @@ def _check_crate(crate):
         elif filename.startswith('.'):
             yield warn(HiddenFile, filename)
 
+        member_bytes = tar.extractfile(member).read()
+        # assume it's utf8
+        try:
+            member_str = member_bytes.decode()
+        except UnicodeDecodeError:
+            member_str = None
+        else:
+            if all(pat in member_str for pat in ('[registry]', 'token')):
+                yield warn(CargoToken, member.name)
+
         parts = path.parts
         if len(parts) > 1 and parts[-2:] == ('.cargo', 'config'):
             yield warn(CargoConfig)
-            if 'token' in tar.extractfile(member).read().decode():
+            if member_str is not None and 'token' in member_str:
                 yield warn(CargoToken)
 
         for part in parts[:-1]:
@@ -496,8 +493,7 @@ def _iter_warnings_async():
         pool.close()
         pool.join()
     for res in results:
-        for r in res.get():
-            yield r
+        yield from res.get()
 
 
 def _unique_warnings():
@@ -505,7 +501,9 @@ def _unique_warnings():
     of affected files, pointing to affected versions'''
     d = {}
     for warning in _iter_warnings_async():
-        if isinstance(warning, (OwnerSet, Executable)):
+        # Exclude stuff that is mostly uninteresting
+        if isinstance(warning, (OwnerSet, Executable, LocalBuildFiles, Trash,
+                                TarError)):
             continue
         krate = d.setdefault((warning.reason, warning.crate_name,
                               warning.info), {})
@@ -523,15 +521,8 @@ def report_warnings():
 
 
 def _count_warnings():
-    d = {}
-    for line in sys.stdin:
-        reason, crate_name, _, info, _ = line.split('\t')
-        k = (reason, info)
-        try:
-            d[k] += 1
-        except KeyError:
-            d[k] = 1
-    return d
+    return collections.Counter(((reason, info) for reason, _, _, info, _ in
+                                (line.split('\t') for line in sys.stdin)))
 
 
 def report_counts():
@@ -576,14 +567,17 @@ class TestFileDetection(unittest.TestCase):
     def test_cargo_api_key(self):
         buf, tar = self._create_tarfile()
         info = tarfile.TarInfo('.cargo/config')
-        content = 'token = foobar'.encode()
+        content = '[registry]\ntoken = foobar'.encode()
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
         tar.close()
         crate = Crate(0, 'TEST', '0', buf.getvalue())
         warnings = _check_crate(crate)
+        # detects both the filename and the content
+        self.assertTrue(isinstance(next(warnings), CargoToken))
         self.assertTrue(isinstance(next(warnings), CargoConfig))
         self.assertTrue(isinstance(next(warnings), CargoToken))
+        self.assertTrue(isinstance(next(warnings), HiddenPath))
 
     def test_false_positive_asc(self):
         crate = self.spawn_crate('some.javascript')
