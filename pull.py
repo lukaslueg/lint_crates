@@ -3,7 +3,8 @@
 git clone https://github.com/rust-lang/crates.io-index
 python3 -c "import pull; pull.sync_db_to_index_dir()"
 python3 -c "import pull; pull.report_warnings()" >! report.txt
-python3 -c "import pull; pull.report_counts()" < report.txt | discount-makepage >! report.html
+python3 -c "import pull; pull.report_counts()" < report.txt \
+    | discount-makepage >! report.html
 
 '''
 
@@ -101,6 +102,14 @@ class CargoConfig(Warning):
     pass
 
 
+class AWSToken(Warning):
+    CLIENT_ID_PATTERN = re.compile('AKIA[0-9A-Z]{16}')
+
+
+class PrivateKey(Warning):
+    PGP_PATTERN = re.compile('-----BEGIN (RSA )?PRIVATE KEY-----')
+
+
 class CargoToken(Warning):
     pass
 
@@ -141,13 +150,73 @@ LOCAL_BUILD_FILENAMES = frozenset(
      '.valgrind.supp', '.dockerignore', '.emacs.bmk', '.hgignore',
      '.travis-bench', '.zuul.yml', '.npmrc', '.eslintignore', '.dntrc',
      '.jsbeautifyrc', '.sconsign.dblite', '.jscs.json', '.astylerc',
-     '.build.sh', '.buildpack'))
+     '.build.sh', '.buildpack', '.cvsignore', '.bzrignore', '.coveragerc'))
 LOCAL_BUILD_DIRS = frozenset(
     ('.git', '.gitreview', '.hg', '.snakemake', '.gitted', '.travis', '.deps',
      '.libs', '.cargo' '.sconf_temp', '.ci', '.fingerprint', '.idea',
      '.settings', '.sconf_temp'))
 LOCAL_BUILD_EXTS = frozenset(
     ('.swp', '.swo', '.swn', '.kate-swp', '.swl', '.un~', '.tmp'))
+
+
+def _false_positive_filters():
+    '''Generate an iterable of callables that match a warning against a list
+    of known false positives'''
+
+    def _filter(reason, crate_re, member_re, warning):
+        return ((reason is None
+                 or isinstance(warning, reason))
+                and (crate_re is None or crate_re.match(warning.crate_name))
+                and (member_re is None
+                     or (warning.member_name
+                         and member_re.match(warning.member_name))))
+
+    for reason, desc in (
+            (SensitiveFile,
+             (('openssl', '.*/test/.*'),
+              ('tiny-http', '.*/examples/.*'),
+              ('curl-sys', '.*/tests/.*'),
+              ('pcap', '.*/tests/.*'),
+              ('gpgme', '.*/tests/.*'),
+              ('xyio', '.*/(examples/.*|password_callback.hpp)'))),
+            (PrivateKey,
+             (('openssl', '.*/test/.*'),
+              ('libssh', '.*/(example.rs|src/ssh_key.rs)'),
+              ('libressl-pnacl-sys', '.*/(tests|man)/.*'),
+              ('xyio', '.*/src/examples/.*'),
+              ('nanny-sys', '.*/http_signing.md'),
+              ('libssh2-sys', r'.*/(tests/.*|wincng\.c|libgcrypt\.c)'),
+              ('curl-sys', '.*/(tests|docs)/.*'),
+              ('tiny_http', '.*/examples/.*'),
+              ('security-framework', '.*/test/.*'),
+              ('pem-parser', '.*/test_data/.*'),
+              ('civet-sys', '.*/(resources/ss_cert.pem|civetweb/.*)'),
+              ('cql_bindgen', '.*/cert.key'))),
+            (CargoToken,
+             (('cargo', '.*/tests/.*'),
+              ('cargo', '.*/src/doc/config.md'))),
+            (AWSToken,
+             (('unicode_names', '.*/src/generated.rs'),
+              ('rusoto', '.*/tests/unit/.*')))):
+        for crate_pat, member_pat in desc:
+            crate_re = re.compile(crate_pat) if crate_pat else None
+            member_re = re.compile(member_pat) if member_pat else None
+            yield functools.partial(_filter, reason, crate_re, member_re)
+
+
+def _filter_false_positives(f):
+    '''Used to decorate the _check_crate function to filter out known false
+    positives'''
+    filters = tuple(_false_positive_filters())
+
+    @functools.wraps(f)
+    def _filtered_check_crate(crate):
+        for warning in f(crate):
+            if any(f(warning) for f in filters):
+                continue
+            yield warning
+
+    return _filtered_check_crate
 
 
 def _check_pattern(pattern, other):
@@ -227,23 +296,6 @@ def _fetch_json(url):
         raise RuntimeError(err[0]['detail'])
 
 
-def _iter_crates():
-    '''Fetch and iterate over all crates from crates.io'''
-    page = 1
-    while True:
-        url = '/api/v1/crates?page=%i&per_page=100' % (page, )
-        crates = _fetch_json(url)['crates']
-        if len(crates) == 0:
-            break
-        yield from crates
-        page += 1
-
-
-def _iter_versions(crate):
-    '''Fetch and iterate over all versions of given crate.'''
-    return iter(_fetch_json(crate['links']['versions'])['versions'])
-
-
 def _download_version(version):
     '''Fetch the compressed tarball of a given crate's version'''
     # TODO signature checking anyone?
@@ -267,24 +319,6 @@ def _fetch_and_insert_crate(cursor, version):
             '''
     cursor.execute(sql, (version['id'], version['crate'], version['num'],
                          _download_version(version)))
-
-
-def pull_everything():
-    '''Fetch all the things from crates.io'''
-
-    assert False, '''Please don't do this. Pulling everything this way from
-crates.io places quite an unusual burden on it's S3-account. Contact me on
-github to get a dump (~2.6gb) torrented'''
-
-    con = _get_db_connection()
-    known_ids = frozenset(_known_ids(con))
-    for crate in _iter_crates():
-        for version in _iter_versions(crate):
-            print('%s (%s)' % (version['crate'], version['num']))
-            if int(version['id']) in known_ids:
-                print('Skipped download')
-                continue
-            _fetch_and_insert_crate(con, version)
 
 
 def dump_crate_to_file(id_or_name, num=None):
@@ -393,6 +427,7 @@ def _unpacked_size():
     print(i)
 
 
+@_filter_false_positives
 def _check_crate(crate):
     '''Check a given crate and iterate over all warnings related to it'''
     tar = crate.body
@@ -442,8 +477,15 @@ def _check_crate(crate):
         except UnicodeDecodeError:
             member_str = None
         else:
+            # TODO It would be better to have one master pattern for all the
+            # things so member_str is only scanned once...
             if all(pat in member_str for pat in ('[registry]', 'token')):
                 yield warn(CargoToken, member.name)
+            for token in AWSToken.CLIENT_ID_PATTERN.findall(member_str):
+                if token != 'AKIAIOSFODNN7EXAMPLE':
+                    yield warn(AWSToken, member.name)
+            if PrivateKey.PGP_PATTERN.search(member_str) is not None:
+                yield warn(PrivateKey, member.name)
 
         parts = path.parts
         if len(parts) > 1 and parts[-2:] == ('.cargo', 'config'):
@@ -545,39 +587,71 @@ def report_counts():
         print('|'.join(map(_markdown_escape, (reason, info, str(count)))))
 
 
+class TestFalsePositives(unittest.TestCase):
+
+    def setUp(self):
+        self.filters = _false_positive_filters()
+
+    def test_private_key(self):
+        w = PrivateKey('openssl', None, None, 'foo/test/key.pem')
+        self.assertTrue(any((f(w) for f in self.filters)))
+
+
 class TestFileDetection(unittest.TestCase):
 
     @staticmethod
-    def _create_tarfile(member=None):
+    def _create_tarfile(member=None, content=None):
         buf = io.BytesIO()
         tar = tarfile.open(fileobj=buf, mode='w:gz')
         if member is not None:
             info = tarfile.TarInfo(member)
-            info.size = 0
-            tar.addfile(info, io.BytesIO())
+            content_bytes = content.encode()
+            info.size = len(content_bytes)
+            tar.addfile(info, io.BytesIO(content_bytes))
             tar.close()
             return buf.getvalue()
         else:
             return buf, tar
 
     @classmethod
-    def spawn_crate(cls, member):
-        return Crate(0, 'TEST', '0', cls._create_tarfile(member))
+    def spawn_crate(cls, member, content=''):
+        return Crate(0, 'TEST', '0', cls._create_tarfile(member, content))
 
     def test_cargo_api_key(self):
-        buf, tar = self._create_tarfile()
-        info = tarfile.TarInfo('.cargo/config')
-        content = '[registry]\ntoken = foobar'.encode()
-        info.size = len(content)
-        tar.addfile(info, io.BytesIO(content))
-        tar.close()
-        crate = Crate(0, 'TEST', '0', buf.getvalue())
+        crate = self.spawn_crate('.cargo/config', '[registry]\ntoken = foobar')
         warnings = _check_crate(crate)
         # detects both the filename and the content
         self.assertTrue(isinstance(next(warnings), CargoToken))
         self.assertTrue(isinstance(next(warnings), CargoConfig))
         self.assertTrue(isinstance(next(warnings), CargoToken))
         self.assertTrue(isinstance(next(warnings), HiddenPath))
+
+    def test_private_rsa_key(self):
+        crate = self.spawn_crate('my_aws_key',
+                                 'foo -----BEGIN RSA PRIVATE KEY----- bar')
+        warnings = _check_crate(crate)
+        self.assertTrue(isinstance(next(warnings), PrivateKey))
+        self.assertRaises(StopIteration, warnings.__next__)
+
+    def test_private_key(self):
+        crate = self.spawn_crate('my_aws_key',
+                                 'foo -----BEGIN PRIVATE KEY----- bar')
+        warnings = _check_crate(crate)
+        self.assertTrue(isinstance(next(warnings), PrivateKey))
+        self.assertRaises(StopIteration, warnings.__next__)
+
+    def test_aws_api_key(self):
+        crate = self.spawn_crate('my_aws_key',
+                                 'aws_key = AKIA1111111111111111;')
+        warnings = _check_crate(crate)
+        self.assertTrue(isinstance(next(warnings), AWSToken))
+        self.assertRaises(StopIteration, warnings.__next__)
+
+    def test_aws_api_key_false_positive(self):
+        crate = self.spawn_crate('my_aws_key',
+                                 'aws_key = AKIAIOSFODNN7EXAMPLE')
+        warnings = _check_crate(crate)
+        self.assertRaises(StopIteration, warnings.__next__)
 
     def test_false_positive_asc(self):
         crate = self.spawn_crate('some.javascript')
